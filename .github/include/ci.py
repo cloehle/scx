@@ -1,55 +1,203 @@
 #!/usr/bin/env python3
 
+import asyncio
 import argparse
 import glob
 import json
 import os
 import random
+import shutil
+import string
 import subprocess
 import sys
-from typing import List, Optional
+import tempfile
+from typing import List, Optional, Dict
 
 
-def run_command(
-    cmd: List[str],
-    check: bool = True,
-    env: Optional[dict] = None,
-    cwd: Optional[str] = None,
-) -> subprocess.CompletedProcess:
-    """Run a command and return the result."""
+async def run_command(cmd: List[str], cwd: Optional[str] = None) -> str:
     print(f"Running: {' '.join(cmd)}", flush=True)
-    merged_env = os.environ.copy()
-    if env:
-        merged_env.update(env)
-    return subprocess.run(cmd, check=check, env=merged_env, cwd=cwd)
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+
+    stdout, stderr = await proc.communicate()
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode,
+            cmd,
+            output=stdout,
+            stderr=stderr
+        )
+
+    return stdout.decode()
 
 
-def get_kernel_path(kernel_name: str) -> str:
+async def get_kernel_path(kernel_name: str) -> str:
     """Get the kernel path from Nix store for the given kernel name."""
-    result = subprocess.run(
-        [
-            "nix",
-            "build",
-            "--no-link",
-            "--print-out-paths",
-            f"./.github/include#kernel_{kernel_name}",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+    stdout = await run_command([
+        "nix",
+        "build",
+        "--no-link",
+        "--print-out-paths",
+        f"./.github/include#kernel_{kernel_name}",
+    ])
+    return stdout.strip() + "/bzImage"
+
+
+async def run_command_in_vm(
+        kernel: str, command: List[str], memory: int = 1024 * 1024 * 1024, cpus: int = 2
+) -> str:
+    mem_mb = int(memory/1024/1024)
+
+    cmd = [
+        "vng",
+        "-r",
+        await get_kernel_path(kernel),
+        "--memory",
+        f"{mem_mb}M",
+        "--cpus",
+        str(cpus),
+    ]
+    if os.environ.get("CI") == "true":
+        # verbose in CI but not locally
+        cmd += ["-v"]
+
+        # CI runs in /var/cache/private which fails the usual cwd stuff. mount
+        # it elsewhere and use that as the root.
+        cmd += [
+            "--overlay-rwdir=/tmp",
+            "--rodir=/tmp/workspace=.",
+            "--cwd=/tmp/workspace",
+        ]
+
+    # VM gets a different PATH to this program so fix the path of the binary. Other args left to the user.
+    arg0 = shutil.which(command[0])
+    cmd += [
+        "--",
+        arg0
+    ] + command[1:]
+
+    return await run_command(cmd)
+
+
+def parse_scheduler_kernel_requirements(
+    scheduler_metadata: dict, default_kernel: str = "sched_ext/for-next"
+) -> dict:
+    """Parse kernel requirements from scheduler metadata."""
+    kernel_config = scheduler_metadata.get("ci", {}).get("kernel", {})
+
+    return {
+        "default": kernel_config.get("default", default_kernel),
+        "allowlist": kernel_config.get("allowlist", []),
+        "blocklist": kernel_config.get("blocklist", []),
+    }
+
+
+def get_available_kernels() -> List[str]:
+    """Get list of available kernels from kernel-versions.json."""
+    with open("kernel-versions.json", "r") as f:
+        kernel_data = json.load(f)
+    return list(kernel_data.keys())
+
+
+async def extract_bpf_objects(scheduler_name: str, output_dir: str) -> List[str]:
+    """Extract BPF objects from scheduler binary using existing script."""
+
+    # Find the scheduler binary in target/debug
+    binary_path = f"target/debug/{scheduler_name}"
+    if not os.path.exists(binary_path):
+        raise Exception(f"Warning: Scheduler binary {binary_path} not found")
+
+    result = await run_command(["./scripts/extract_bpf_objects.sh",
+        binary_path, output_dir]
     )
-    return result.stdout.strip() + "/bzImage"
+
+    # Find extracted .bpf.o files
+    bpf_objects = []
+    for file in os.listdir(output_dir):
+        if not file.endswith(".bpf.o"):
+            raise Exception(f"unexpected file {file} in extract dir")
+        bpf_objects.append(os.path.join(output_dir, file))
+
+    if not bpf_objects:
+        raise Exception(f"No BPF objects found for {scheduler_name}")
+
+    return bpf_objects
 
 
-def get_clippy_packages() -> List[str]:
+async def generate_veristat_matrix(default_kernel: str = "sched_ext/for-next") -> List[dict]:
+    """Generate scheduler-kernel matrix for veristat testing."""
+    schedulers = await get_scheduler_packages()
+    available_kernels = get_available_kernels()
+
+    matrix = []
+
+    for scheduler in schedulers:
+        kernel_reqs = parse_scheduler_kernel_requirements(
+            scheduler["metadata"], default_kernel
+        )
+
+        for kernel in available_kernels:
+            # Skip if kernel is blocklisted
+            if kernel in kernel_reqs["blocklist"]:
+                continue
+
+            # For non-default kernels, check allowlist if it exists
+            if kernel != kernel_reqs["default"] and kernel_reqs["allowlist"]:
+                if kernel not in kernel_reqs["allowlist"]:
+                    continue
+
+            matrix.append(
+                {
+                    "scheduler": scheduler["name"],
+                    "kernel": kernel,
+                    "is_default_kernel": kernel == kernel_reqs["default"],
+                }
+            )
+
+    return matrix
+
+
+async def get_scheduler_packages() -> List[dict]:
+    """Get list of scheduler packages from cargo metadata."""
+    # TODO: figure out why these scheds break things
+    EXCLUDED_SCHEDULERS = {
+        "scx_p2dq",
+        "scx_chaos",
+        "scx_mitosis",
+        "scx_tickless",
+        "scx_wd40",
+    }
+
+    stdout = await run_command(["cargo", "metadata", "--format-version", "1"])
+    metadata = json.loads(stdout)
+
+    schedulers = []
+    for pkg in metadata.get("packages", []):
+        # Look for schedulers in scheds/ directory
+        manifest_path = pkg.get("manifest_path", "")
+        if "scheds/" in manifest_path and pkg["name"] not in EXCLUDED_SCHEDULERS:
+            pkg_metadata = pkg.get("metadata") or {}
+            scx_metadata = pkg_metadata.get("scx", {})
+            schedulers.append(
+                {
+                    "name": pkg["name"],
+                    "path": pkg["manifest_path"],
+                    "metadata": scx_metadata,
+                }
+            )
+
+    return schedulers
+
+
+async def get_clippy_packages() -> List[str]:
     """Get list of packages that should be linted with clippy."""
-    result = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    metadata = json.loads(result.stdout)
+    stdout = await run_command(["cargo", "metadata", "--format-version", "1"])
+    metadata = json.loads(stdout)
 
     clippy_packages = []
     for pkg in metadata.get("packages", []):
@@ -62,49 +210,49 @@ def get_clippy_packages() -> List[str]:
     return clippy_packages
 
 
-def run_format():
+async def run_format():
     """Format all targets."""
     print("Running format...", flush=True)
 
     py_files = glob.glob(".github/include/**/*.py", recursive=True)
     if py_files:
-        run_command(["black"] + py_files)
-        run_command(["isort"] + py_files)
+        await run_command(["black"] + py_files)
+        await run_command(["isort"] + py_files)
 
-    run_command(["cargo", "fmt"])
+    await run_command(["cargo", "fmt"])
 
     nix_files = glob.glob("**/*.nix", root_dir=".github/include/", recursive=True)
     if nix_files:
-        run_command(
+        await run_command(
             ["nix", "--extra-experimental-features", "nix-command flakes", "fmt"]
             + nix_files,
             cwd=".github/include",
         )
 
-    run_command(["git", "diff", "--exit-code"])
+    await run_command(["git", "diff", "--exit-code"])
     print("✓ Format completed successfully", flush=True)
 
 
-def run_build():
+async def run_build():
     """Build all targets."""
     print("Running build...", flush=True)
 
-    run_command(["cargo", "build", "--all-targets", "--locked"])
+    await run_command(["cargo", "build", "--all-targets", "--locked"])
     print("✓ Build completed successfully", flush=True)
 
 
-def run_clippy():
+async def run_clippy():
     """Run clippy on packages marked for CI linting."""
     print("Running clippy...", flush=True)
 
     clippy_packages = get_clippy_packages()
     for package in clippy_packages:
-        run_command(["cargo", "clippy", "--no-deps", "-p", package, "--", "-Dwarnings"])
+        await run_command(["cargo", "clippy", "--no-deps", "-p", package, "--", "-Dwarnings"])
 
     print("✓ Clippy checks passed", flush=True)
 
 
-def run_tests():
+async def run_tests():
     """Run the test suite."""
     print("Running tests...", flush=True)
 
@@ -125,12 +273,11 @@ def run_tests():
     # Get CPU count
     cpu_count = min(os.cpu_count(), 16)
 
-    # Find kernel image
-    kernel_path = get_kernel_path("sched_ext/for-next")
-    if not os.path.exists(kernel_path):
-        print(f"Error: Kernel image not found at {kernel_path}")
-        print("Make sure to run the build-kernel job first")
-        sys.exit(1)
+    await run_command_in_vm("sched_ext/for-next", [
+        sys.argv[0],
+        "test-in-vm",
+    ], cpus = min(os.cpu_count(), 16))
+
 
     cmd = [
         "vng",
@@ -141,17 +288,6 @@ def run_tests():
         "-r",
         kernel_path,
     ]
-    if os.environ.get("CI") == "true":
-        # verbose in CI but not locally
-        cmd += ["-v"]
-
-        # CI runs in /var/cache/private which fails the usual cwd stuff. mount
-        # it elsewhere and use that as the root.
-        cmd += [
-            "--overlay-rwdir=/tmp",
-            "--rodir=/tmp/workspace=.",
-            "--cwd=/tmp/workspace",
-        ]
 
     cmd += [
         "--",
@@ -165,7 +301,266 @@ def run_tests():
     print("✓ Tests completed successfully", flush=True)
 
 
-def run_tests_in_vm():
+
+async def run_veristat():
+    """Run veristat verification on all schedulers across all compatible kernels."""
+    print("Running veristat verification...", flush=True)
+
+    # Generate the testing matrix
+    matrix = await generate_veristat_matrix()
+    if not matrix:
+        print("No scheduler-kernel combinations to test")
+        return
+
+    print(f"Testing {len(matrix)} scheduler-kernel combinations:")
+    for item in matrix:
+        print(f"  - {item['scheduler']} on {item['kernel']}")
+
+    # Group by kernel to reuse VMs
+    kernels_to_test = {}
+    for item in matrix:
+        kernel = item["kernel"]
+        if kernel not in kernels_to_test:
+            kernels_to_test[kernel] = []
+        kernels_to_test[kernel].append(item["scheduler"])
+
+    # Create temporary directory for BPF object extraction
+    with tempfile.TemporaryDirectory() as temp_dir:
+        print(f"Using temporary directory: {temp_dir}")
+
+        # Extract BPF objects for all schedulers (parallelise over scheds)
+        schedulers = list({item["scheduler"] for item in matrix})
+        extractors = []
+        for sched in schedulers:
+            d = os.path.join(temp_dir, sched)
+            os.makedirs(d, exist_ok = True)
+            extractors.append(extract_bpf_objects(sched, d))
+
+        scheduler_bpf_objects = {sched: bpf_objects for sched, bpf_objects in zip(schedulers, await asyncio.gather(*extractors))}
+
+        # Veristat only shows the basename of each file in the CSV output. Ensure
+        # each path name is unique before passing them to veristat so we can
+        # reverse map them later.
+        unique_bpf_object_names = set()
+        for objs in scheduler_bpf_objects.values():
+            for i, obj in enumerate(objs):
+                mod = False
+                while os.path.basename(obj) in unique_bpf_object_names:
+                    mod = True
+                    obj = obj + random.choice(string.ascii_lowercase)
+                if mod:
+                    os.rename(objs[i], obj)
+                objs[i] = obj
+                unique_bpf_object_names.add(os.path.basename(obj))
+
+        # Start veristat VMs (parallelise over kernels)
+        running_processes = {}
+        total_tests = len(matrix)
+
+        print(f"\n=== Starting parallel veristat VMs ===")
+
+        veristat_vms = list()
+        for kernel, schedulers in kernels_to_test.items():
+            # Collect all BPF objects for this kernel
+            all_bpf_objects = []
+            valid_schedulers = []
+
+            for scheduler in schedulers:
+                bpf_objects = scheduler_bpf_objects[scheduler]
+                all_bpf_objects.extend(bpf_objects)
+                valid_schedulers.append(scheduler)
+
+            async def get_veristat_result(kernel):
+                try:
+                    stdout = await run_command_in_vm(kernel, [
+                        "veristat",
+                        "-o",
+                        "csv",
+                    ] + all_bpf_objects)
+
+                    return { "success": True, "csv": stdout }
+                except subprocess.CalledProcessError as e:
+                    return { "success": False, "return_code": e.returncode, "stdout": e.stdout, "stderr": e.stderr }
+
+            veristat_vms.append(get_veristat_result(kernel))
+
+        print(f"Started {len(veristat_vms)} parallel veristat VMs")
+
+        # Wait for all processes to complete and collect results
+        print(f"\n=== Collecting results ===")
+        veristat_results = {kernel: result for kernel, result in zip(kernels_to_test.keys(), await asyncio.gather(*veristat_vms))}
+
+        veristat_failures = [(k, r) for k, r in veristat_results.items() if not r["success"]]
+        if veristat_failures:
+            for kernel, res in veristat_failures:
+                print(f"✗ Veristat failed for kernel {kernel} with return code {res['return_code']} and stdout:")
+                print(res["stdout"])
+                print("And stderr:")
+                print(res["stderr"])
+            raise Exception(f"vmtest failed to complete on {len(veristat_failures)} kernels")
+
+        veristat_csvs = {k: r["csv"] for k, r in veristat_results.items()}
+        print(f"Raw veristat_csvs keys: {list(veristat_csvs.keys())}")
+        for kernel, csv in veristat_csvs.items():
+            print(f"CSV for {kernel}: {len(csv)} chars, first 200: {csv[:200]}")
+
+        # Process CSV data for successful results
+        print(f"\n=== Processing CSV data ===")
+        bpf_object_to_scheduler = {
+            os.path.basename(bpf_obj): scheduler
+            for scheduler in schedulers
+            for bpf_obj in scheduler_bpf_objects[scheduler]
+        }
+        print(f"bpf_object_to_scheduler mapping: {bpf_object_to_scheduler}")
+
+        # Create unified list of verification results: [{'scheduler': str, 'kernel': str, 'failed': bool, 'csv_data': str}, ...]
+        verification_results = []
+        
+        for kernel, csv_content in veristat_csvs.items():
+            print(f"\nProcessing kernel {kernel}")
+            if not csv_content.strip():
+                print(f"  Skipping {kernel} - empty CSV content")
+                continue
+            
+            # Parse CSV content line by line to group by scheduler
+            lines = csv_content.strip().split('\n')
+            if len(lines) < 2:  # Need at least header + 1 data row
+                print(f"  Skipping {kernel} - insufficient CSV data")
+                continue
+                
+            header_line = lines[0]
+            print(f"  CSV header: {header_line}")
+            
+            # Parse and group rows by scheduler
+            import csv
+            import io
+            reader = csv.DictReader(io.StringIO(csv_content.strip()))
+            
+            scheduler_data = {}  # scheduler -> {'lines': [str], 'has_failure': bool}
+            row_count = 0
+            
+            # Process each data row
+            for row in reader:
+                row_count += 1
+                cleaned_row = {
+                    key.strip(): value.strip() if isinstance(value, str) else value
+                    for key, value in row.items()
+                }
+                
+                file_name = cleaned_row.get("file_name", "")
+                verdict = cleaned_row.get("verdict", "").lower()
+                
+                print(f"    Row {row_count}: file_name='{file_name}', verdict='{verdict}'")
+                scheduler = bpf_object_to_scheduler[os.path.basename(file_name)]
+                print(f"    Mapped to scheduler: {scheduler}")
+                
+                # Initialize scheduler data if needed
+                if scheduler not in scheduler_data:
+                    scheduler_data[scheduler] = {'lines': [], 'has_failure': False}
+                
+                # Add the original CSV line (reconstruct from parsed data)
+                line_values = [cleaned_row.get(field.strip(), '') for field in reader.fieldnames]
+                csv_line = ','.join(f'"{val}"' if ',' in str(val) or '"' in str(val) else str(val) for val in line_values)
+                scheduler_data[scheduler]['lines'].append(csv_line)
+                
+                # Track if any row failed
+                if verdict != 'success':
+                    scheduler_data[scheduler]['has_failure'] = True
+            
+            print(f"  Processed {row_count} rows, found schedulers: {list(scheduler_data.keys())}")
+            
+            # Create CSV data for each scheduler
+            for scheduler, data in scheduler_data.items():
+                if not data['lines']:
+                    continue
+                    
+                # Combine header with scheduler's data lines
+                scheduler_csv = header_line + '\n' + '\n'.join(data['lines'])
+                
+                verification_results.append({
+                    'scheduler': scheduler,
+                    'kernel': kernel,
+                    'failed': data['has_failure'],
+                    'csv_data': scheduler_csv
+                })
+                
+                print(f"  Created CSV for {scheduler} on {kernel}: {len(scheduler_csv)} chars, failed={data['has_failure']}")
+        
+        print(f"\nCreated {len(verification_results)} scheduler-kernel verification results")
+        
+        # Split into successes and failures
+        success_results = [r for r in verification_results if not r['failed']]
+        failure_results = [r for r in verification_results if r['failed']]
+        
+        print(f"\nVerification summary:")
+        print(f"  Successes: {len(success_results)}")
+        print(f"  Failures: {len(failure_results)}")
+        
+        # Generate human-readable output using veristat -R
+        print(f"\n=== Generating human-readable output ===")
+        
+        async def generate_readable_output(result):
+            """Generate human-readable output for a verification result using veristat -R."""
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.csv') as f:
+                f.write(result['csv_data'])
+                f.flush()
+                
+                readable_output = await run_command_in_vm(result['kernel'], [
+                    "veristat", "-R", f.name
+                ])
+                
+                return {
+                    'scheduler': result['scheduler'],
+                    'kernel': result['kernel'],
+                    'failed': result['failed'],
+                    'output': readable_output.strip()
+                }
+        
+        # Generate readable output in parallel for all results
+        readable_results = await asyncio.gather(*[generate_readable_output(result) for result in verification_results])
+        
+        # Sort results by scheduler name
+        readable_results.sort(key=lambda x: x['scheduler'])
+        
+        # Split into successes and failures for display
+        readable_successes = [r for r in readable_results if not r['failed']]
+        readable_failures = [r for r in readable_results if r['failed']]
+        
+        # Display successful results first
+        print(f"\n" + "="*80)
+        print(f"SUCCESSFUL VERIFICATIONS ({len(readable_successes)} results)")
+        print("="*80)
+        
+        if readable_successes:
+            for result in readable_successes:
+                print(f"\n📈 {result['scheduler']} on {result['kernel']}")
+                print("-" * 60)
+                print(result['output'])
+        else:
+            print("\nNo successful verifications.")
+        
+        # Display failure results
+        print(f"\n" + "="*80)
+        print(f"FAILED VERIFICATIONS ({len(readable_failures)} results)")
+        print("="*80)
+        
+        if readable_failures:
+            for result in readable_failures:
+                print(f"\n❌ {result['scheduler']} on {result['kernel']}")
+                print("-" * 60)
+                print(result['output'])
+        else:
+            print("\nNo failed verifications.")
+        
+        # Print final status and throw if there were failures
+        if readable_failures:
+            print(f"\n✗ Veristat verification failed ({len(readable_failures)} schedulers had failures)", flush=True)
+            raise Exception(f"Veristat verification failed for {len(readable_failures)} scheduler-kernel combinations")
+        else:
+            print(f"\n✓ Veristat verification completed successfully ({len(readable_successes)} schedulers passed)", flush=True)
+
+
+async def run_tests_in_vm():
     """Run tests when already inside the VM."""
 
     run_command(
@@ -184,15 +579,16 @@ def run_tests_in_vm():
     run_command(["target/debug/scx_lib_selftests"])
 
 
-def run_all():
+async def run_all():
     """Run all CI steps in the correct order."""
-    run_format()
-    run_build()
-    run_clippy()
-    run_tests()
+    await run_format()
+    await run_build()
+    await run_clippy()
+    await run_veristat()
+    await run_tests()
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="SCX CI Script")
 
     subparsers = parser.add_subparsers(
@@ -206,6 +602,9 @@ def main():
         "clippy", help="Run Clippy on crates that request it"
     )
     parser_test = subparsers.add_parser("test", help="Run Rust tests")
+    parser_veristat = subparsers.add_parser(
+        "veristat", help="Run veristat verification on all schedulers"
+    )
 
     parser_all = subparsers.add_parser("all", help="Run all commands")
 
@@ -217,18 +616,20 @@ def main():
     args = parser.parse_args()
 
     if args.command == "format":
-        run_format()
+        await run_format()
     elif args.command == "build":
-        run_build()
+        await run_build()
     elif args.command == "clippy":
-        run_clippy()
+        await run_clippy()
     elif args.command == "test":
-        run_tests()
+        await run_tests()
+    elif args.command == "veristat":
+        await run_veristat()
     elif args.command == "test-in-vm":
-        run_tests_in_vm()
+        await run_tests_in_vm()
     elif args.command == "all":
-        run_all()
+        await run_all()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -193,6 +193,9 @@
                 # fenix managed rust toolchain + nixpkgs cargo-nextest
                 cargo-nextest
                 rust-toolchain
+              ] ++ [
+                # veristat for BPF verification
+                self.packages.${system}.veristat
               ];
 
               makeWrapperArgs = lib.lists.flatten ([
