@@ -125,6 +125,7 @@ void BPF_STRUCT_OPS(central_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	__sync_fetch_and_add(&nr_queued, 1);
+	scx_bpf_dsq_insert(p, FALLBACK_DSQ_ID, SCX_SLICE_INF, enq_flags);
 
 	if (!scx_bpf_task_running(p))
 		scx_bpf_kick_cpu(central_cpu, SCX_KICK_PREEMPT);
@@ -151,7 +152,7 @@ static bool dispatch_to_cpu(s32 cpu)
 		 * If we can't run the task at the top, do the dumb thing and
 		 * bounce it to the fallback dsq.
 		 */
-		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr) || is_migration_disabled(p)) {
 			__sync_fetch_and_add(&nr_mismatches, 1);
 			scx_bpf_dsq_insert(p, FALLBACK_DSQ_ID, SCX_SLICE_INF, 0);
 			bpf_task_release(p);
@@ -344,7 +345,7 @@ SCX_OPS_DEFINE(central_ops,
 		* and thus being the last task on a given CPU doesn't mean
 		* anything special. Enqueue the last tasks like any other tasks.
 		*/
-	       .flags			= SCX_OPS_ENQ_LAST,
+	       .flags			= SCX_OPS_ENQ_LAST | SCX_OPS_ENQ_MIGRATION_DISABLED,
 
 	       .select_cpu		= (void *)central_select_cpu,
 	       .enqueue			= (void *)central_enqueue,
