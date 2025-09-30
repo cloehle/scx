@@ -111,7 +111,14 @@ void BPF_STRUCT_OPS(storm_dispatch, s32 cpu, struct task_struct *prev)
 				return;
 			}
 			stat_inc(MAX_DSQS+1);
-			scx_bpf_dsq_insert(p, random_dsq(), SCX_SLICE_DFL, 0);
+			if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr) || is_migration_disabled(p))
+				scx_bpf_dsq_insert(p, random_dsq(), SCX_SLICE_DFL, 0);
+			else {
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, SCX_SLICE_DFL, 0);
+				bpf_task_release(p);
+				break;
+			}
+
 			bpf_task_release(p);
 		}
 		if (scx_bpf_dsq_move_to_local(random)) {
