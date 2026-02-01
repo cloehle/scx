@@ -37,7 +37,7 @@ static void sigint_handler(int simple)
 	exit_req = 1;
 }
 
-#define NR_STATS 7
+#define NR_STATS 8
 
 static void read_stats(struct scx_storm *skel, __u64 *stats)
 {
@@ -105,7 +105,7 @@ restart:
 		__u64 stats[2];
 
 		read_stats(skel, stats);
-		printf("0=%llu 1=%llu 2=%llu 3=%llu 4=%llu dsq_moves=%llu queue_moves=%llu\n", stats[0], stats[1], stats[2], stats[3], stats[4], stats[5], stats[6]);
+		printf("0=%llu 1=%llu 2=%llu 3=%llu 4=%llu dsq_moves=%llu qmap_to_dsq=%llu qmap_to_local=%llu\n", stats[0], stats[1], stats[2], stats[3], stats[4], stats[5], stats[6], stats[7]);
 		fflush(stdout);
 		sleep(1);
 	}
